@@ -1,4 +1,8 @@
 import json
+import re
+import time
+import bs4
+import requests
 import telebot
 import threading
 from datetime import datetime, timedelta
@@ -8,6 +12,7 @@ from abc import ABC, abstractmethod
 
 SETTINGS_FILE = 'data/settings.json'
 DATA_FILE = 'data/data.json'
+SCHEDULES_STORAGE = 'data/schedules/'
 BASE_DIR = Path(__file__).parent
 
 
@@ -83,6 +88,7 @@ class DataManager(_Module):
         if user_id in self._users:
             return False
         self._users.add(user_id)
+        self.save()
         return True
 
     def del_user(self, user_id: int) -> bool:
@@ -90,6 +96,7 @@ class DataManager(_Module):
             self._users.remove(user_id)
         except KeyError:
             return False
+        self.save()
         return True
 
     @property
@@ -103,6 +110,60 @@ class DataManager(_Module):
     @last_update.setter
     def last_update(self, date: datetime):
         self._last_update = date
+        self.save()
+
+
+class Parser(_Module):
+    def load(self):
+        pass
+
+    def extract_last_update(self, text):
+        date_regex = re.compile(Core.get_instance().settings.get('re/date_regex'), re.I)
+        time_regex = re.compile(Core.get_instance().settings.get('re/time_regex'), re.I)
+
+        date = date_regex.search(text)
+        day, month, year = date.group().split('.')
+        hour, minute = time_regex.search(text[date.end():]).group().split('.')
+
+        total = {'day': day, 'month': month, 'year': year, 'hour': hour, 'minute': minute}
+        return datetime(**{k: int(v) for k, v in total.items()})
+
+    def extract_schedule(self, paragraph):
+        target_link_regex = re.compile(Core.get_instance().settings.get('re/target_file_regex'), re.I)
+        a = paragraph.find('a', text=target_link_regex)
+        return Core.get_instance().settings.get('scanning/base_url') + a.get('href')
+
+    def parse(self, page):
+        core = Core.get_instance()
+        dom = bs4.BeautifulSoup(page.text)
+        elements = dom.find('div', attrs={'itemprop': 'articleBody'}).find_all('p')
+
+        p_last_update = elements[0]
+        p_interval = elements[2]
+        p_schedule = elements[3]
+
+        last_update = self.extract_last_update(p_last_update.text)
+        if last_update == core.database.last_update:
+            return None
+        core.database.last_update = last_update
+
+        schedule = self.extract_schedule(p_schedule)
+        return schedule
+
+    def update(self):
+        try:
+            req = requests.get(**Core.get_instance().settings.get('scanning/request'))
+            link = self.parse(req)
+            if link is not None:
+                Core.get_instance().bot.mailing(link)
+        except Exception as ex:
+            print(ex)
+
+    def scanning(self):
+        core = Core.get_instance()
+        while True:
+            self.update()
+            time.sleep(core.settings.get('scanning/scan_delay'))
 
 
 class Bot(_Module):
@@ -129,17 +190,26 @@ class Bot(_Module):
         msg = 'messages/command_delete_scs' if res else 'messages/command_delete_err'
         self._bot.send_message(message.from_user.id, core.settings.get(msg))
 
+    def mailing(self, link: str):
+        for u in Core.get_instance().database.users:
+            self._bot.send_message(u, f'Обновление расписания:\n{link}',)
+
     def listening_server(self):
         self._bot.infinity_polling()
 
 
 class Core(_Singleton):
-    __slots__ = ('_bot', '_settings', '_database')
+    __slots__ = ('_bot', '_settings', '_database', '_parser')
 
     def __init__(self):
         self._settings = Settings()
         self._bot = Bot()
         self._database = DataManager()
+        self._parser = Parser()
+
+    @property
+    def parser(self):
+        return self._parser
 
     @property
     def bot(self) -> Bot:
@@ -156,6 +226,7 @@ class Core(_Singleton):
     def load_modules(self):
         self._settings.load()
         self._database.load()
+        self._parser.load()
         self._bot.load()
 
 
@@ -164,6 +235,7 @@ def main():
     core.load_modules()
 
     threading.Thread(target=core.bot.listening_server).start()
+    threading.Thread(target=core.parser.scanning).start()
 
 
 if __name__ == '__main__':
